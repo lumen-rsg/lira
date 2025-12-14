@@ -1,9 +1,7 @@
-//
-// Created by cv2 on 14.12.2025.
-//
-
 #pragma once
+#include <iostream>
 #include <string>
+#include <set>
 
 namespace lira
 {
@@ -31,10 +29,16 @@ namespace lira
         std::string tag_lookahead;
         std::string format_buffer;
 
+        // Reasoning State
+        bool in_thinking = false;
+        int think_spinner_idx = 0;
+
         void flush_word();
+        void render_think_spinner();
 
     public:
-        std::string full_response;
+        std::string full_response; // Raw response (includes tags)
+        std::string visible_response; // Cleaned response (no thoughts/tags)
 
         void print(const std::string& chunk);
         void finish() const;
