@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# --- Configuration ---
+LIRA_DIR="$HOME/.lira"
+SRC_DIR="$LIRA_DIR/src"
+BUILD_DIR="$LIRA_DIR/build"
+BIN_FILE="$LIRA_DIR/build/lira"
+
+mkdir -p "$SRC_DIR" "$BUILD_DIR" "$LIRA_DIR/data"
+
+# --- Argument Parsing ---
+FORCE_REBUILD=0
+ARGS=()
+
+# Loop through all arguments to find --rebuild
+for arg in "$@"; do
+    if [ "$arg" == "--rebuild" ]; then
+        FORCE_REBUILD=1
+    else
+        # Preserve other arguments (like the prompt)
+        ARGS+=("$arg")
+    fi
+done
+
+# --- Helper Function: Build ---
+build_lira() {
+    echo -e "\033[1;34m[BUILD] Compiling Lira...\033[0m"
+
+    # Ensure CMakeLists exists
+    if [ ! -f "$SRC_DIR/CMakeLists.txt" ]; then
+        echo "Error: CMakeLists.txt missing in $SRC_DIR"
+        exit 1
+    fi
+
+    cd "$BUILD_DIR" || exit
+
+    # Run CMake and Make
+    cmake -S "$SRC_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -Wno-dev > /dev/null
+    make -j$(nproc) > /dev/null
+
+    if [ $? -ne 0 ]; then
+        echo -e "\033[1;31m[BUILD] Compilation failed.\033[0m"
+        exit 1
+    fi
+    echo -e "\033[1;32m[BUILD] Success.\033[0m"
+}
+
+# --- Logic ---
+
+# Check API Key
+if [ -z "$OPENROUTER_API_KEY" ]; then
+    echo "Error: OPENROUTER_API_KEY is not set."
+    exit 1
+fi
+
+# Determine if we need to build
+SHOULD_BUILD=0
+
+# 1. Binary missing?
+if [ ! -f "$BIN_FILE" ]; then
+    SHOULD_BUILD=1
+# 2. Source newer than binary? (Automatic check)
+elif [ "$SRC_DIR/lira.cpp" -nt "$BIN_FILE" ]; then
+    SHOULD_BUILD=1
+# 3. User forced it?
+elif [ $FORCE_REBUILD -eq 1 ]; then
+    SHOULD_BUILD=1
+fi
+
+# Execute Build if needed
+if [ $SHOULD_BUILD -eq 1 ]; then
+    build_lira
+fi
+
+# --- Execution ---
+# Pass the filtered arguments (without --rebuild) to the binary
+"$BIN_FILE" "${ARGS[@]}"
