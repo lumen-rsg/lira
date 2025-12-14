@@ -5,73 +5,209 @@ LIRA_DIR="$HOME/.lira"
 SRC_DIR="$LIRA_DIR/src"
 BUILD_DIR="$LIRA_DIR/build"
 BIN_FILE="$LIRA_DIR/build/lira"
+LOG_FILE="/tmp/lira_build.log"
 
-mkdir -p "$SRC_DIR" "$BUILD_DIR" "$LIRA_DIR/data"
+# --- Styling ---
+RESET="\033[0m"
+BOLD="\033[1m"
+DIM="\033[2m"
+CYAN="\033[36m"
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+MAGENTA="\033[35m"
+WHITE="\033[97m"
 
-# --- Argument Parsing ---
+# Box Configuration
+BOX_WIDTH=48  # Total width including borders
+INNER_WIDTH=$((BOX_WIDTH - 2)) # 46 chars inside
+
+# --- Helper: Repeat Character ---
+repeat() {
+    local char=$1
+    local count=$2
+    printf "%0.s$char" $(seq 1 "$count")
+}
+
+# --- CPU Core Detection (macOS/Linux) ---
+detect_cores() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        sysctl -n hw.ncpu 2>/dev/null || echo 4
+    else
+        # Linux / WSL
+        if command -v nproc >/dev/null 2>&1; then
+            nproc
+        else
+            grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 4
+        fi
+    fi
+}
+CORES=$(detect_cores)
+
+# --- TUI Functions ---
+
+draw_header() {
+    clear
+    # Top Border
+    echo -e "${CYAN}╭$(repeat "─" $INNER_WIDTH)╮${RESET}"
+
+    # ASCII Art Lines (Calculated manually for perfect fit in 46 width)
+    # Line 1: /\_/\    LIRA AGENT SYSTEM (Len 27) -> Pad 19
+    echo -e "${CYAN}│${RESET} ${MAGENTA} /\\_/\\ ${RESET}   ${BOLD}LIRA AGENT SYSTEM${RESET}$(repeat " " 18)${CYAN}│${RESET}"
+
+    # Line 2: ( o.o )   v1.1.0 (Len 16) -> Pad 30
+    echo -e "${CYAN}│${RESET} ${MAGENTA}( o.o )${RESET}   ${DIM}v1.1.0${RESET}$(repeat " " 29)${CYAN}│${RESET}"
+
+    # Line 3: > ^ <    C++23 / OpenRouter (Len 28) -> Pad 18
+    echo -e "${CYAN}│${RESET} ${MAGENTA} > ^ < ${RESET}   ${CYAN}C++23 / OpenRouter${RESET}$(repeat " " 17)${CYAN}│${RESET}"
+
+    # Separator
+    echo -e "${CYAN}├$(repeat "─" $INNER_WIDTH)┤${RESET}"
+}
+
+draw_footer() {
+    echo -e "${CYAN}╰$(repeat "─" $INNER_WIDTH)╯${RESET}"
+}
+
+# Usage: print_status "Label" "Value" "ColorCode"
+print_status() {
+    local label="$1"
+    local val="$2"
+    local color="$3"
+
+    # Calculate padding
+    # Format: "  Label" + spaces + "[" + val + "]  "
+    # Fixed overhead: 2 (left sp) + 1 (sp before [) + 1 ([) + 1 (]) + 2 (right sp) = 7 chars
+    # Available for Label + Val + Padding = INNER_WIDTH - 7
+
+    local label_len=${#label}
+    local val_len=${#val}
+    local available=$((INNER_WIDTH - 7))
+    local pad_len=$((available - label_len - val_len))
+
+    if [ $pad_len -lt 0 ]; then pad_len=0; fi # Safety
+
+    printf "${CYAN}│${RESET}  %s%s [${color}%s${RESET}]  ${CYAN}│${RESET}\n" \
+        "$label" "$(repeat " " $pad_len)" "$val"
+}
+
+spinner_pid=""
+start_spinner() {
+    tput civis # Hide cursor
+    local msg="$1"
+    (
+        while :; do
+            for s in "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"; do
+                # Print spinner with correct box formatting
+                # We simply overwrite the line, we don't try to draw the right border perfectly
+                # during animation to avoid flickering complex math,
+                # but we ensure it doesn't overflow.
+                echo -ne "\r${CYAN}│${RESET}  $s  $msg\033[K"
+                sleep 0.1
+            done
+        done
+    ) &
+    spinner_pid=$!
+}
+
+stop_spinner() {
+    if [ -n "$spinner_pid" ]; then
+        kill "$spinner_pid" >/dev/null 2>&1
+        wait "$spinner_pid" >/dev/null 2>&1
+        spinner_pid=""
+    fi
+    tput cnorm # Restore cursor
+    echo -ne "\r\033[K" # Clear line
+}
+
+# --- Build Logic ---
+build_lira() {
+    draw_header
+
+    start_time=$(date +%s)
+
+    # 1. CMake
+    start_spinner "Configuring..."
+    mkdir -p "$BUILD_DIR"
+    # Capture output to log, show only on error
+    if ! cmake -S "$SRC_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release > "$LOG_FILE" 2>&1; then
+        stop_spinner
+        print_status "CMake Config" "FAIL" "$RED"
+        echo -e "${CYAN}├$(repeat "─" $INNER_WIDTH)┤${RESET}"
+        echo -e "${RED}Error Logs:${RESET}"
+        cat "$LOG_FILE"
+        draw_footer
+        exit 1
+    fi
+    stop_spinner
+    print_status "CMake Config" "OK" "$GREEN"
+
+    # 2. Compile
+    start_spinner "Compiling ($CORES threads)..."
+    if ! cmake --build "$BUILD_DIR" -- -j"$CORES" >> "$LOG_FILE" 2>&1; then
+        stop_spinner
+        print_status "Compilation" "FAIL" "$RED"
+        echo -e "${CYAN}├$(repeat "─" $INNER_WIDTH)┤${RESET}"
+        echo -e "${RED}Error Logs:${RESET}"
+        cat "$LOG_FILE"
+        draw_footer
+        exit 1
+    fi
+    stop_spinner
+    print_status "Compilation" "OK" "$GREEN"
+
+    # 3. Stats
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    # Get Size (Cross-platform)
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        size=$(stat -f%z "$BIN_FILE" | awk '{ printf "%.2f KB", $1/1024 }')
+    else
+        size=$(du -h "$BIN_FILE" | cut -f1)
+    fi
+
+    echo -e "${CYAN}├$(repeat "─" $INNER_WIDTH)┤${RESET}"
+    print_status "Build Time" "${duration}s" "$YELLOW"
+    print_status "Binary Size" "$size" "$YELLOW"
+    draw_footer
+    echo ""
+}
+
+# --- Main ---
 FORCE_REBUILD=0
 ARGS=()
 
-# Loop through all arguments to find --rebuild
-for arg in "$@"; do
-    if [ "$arg" == "--rebuild" ]; then
-        FORCE_REBUILD=1
-    else
-        # Preserve other arguments (like the prompt)
-        ARGS+=("$arg")
-    fi
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --rebuild) FORCE_REBUILD=1; shift ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
 done
 
-# --- Helper Function: Build ---
-build_lira() {
-    echo -e "\033[1;34m[BUILD] Compiling Lira...\033[0m"
-
-    # Ensure CMakeLists exists
-    if [ ! -f "$SRC_DIR/CMakeLists.txt" ]; then
-        echo "Error: CMakeLists.txt missing in $SRC_DIR"
-        exit 1
-    fi
-
-    cd "$BUILD_DIR" || exit
-
-    # Run CMake and Make
-    cmake -S "$SRC_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -Wno-dev > /dev/null
-    make -j$(nproc) > /dev/null
-
-    if [ $? -ne 0 ]; then
-        echo -e "\033[1;31m[BUILD] Compilation failed.\033[0m"
-        exit 1
-    fi
-    echo -e "\033[1;32m[BUILD] Success.\033[0m"
-}
-
-# --- Logic ---
-
-# Check API Key
 if [ -z "$OPENROUTER_API_KEY" ]; then
-    echo "Error: OPENROUTER_API_KEY is not set."
+    echo -e "${RED}Error: OPENROUTER_API_KEY is not set.${RESET}"
     exit 1
 fi
 
-# Determine if we need to build
+mkdir -p "$SRC_DIR" "$BUILD_DIR" "$LIRA_DIR/data" "$LIRA_DIR/sessions"
+
 SHOULD_BUILD=0
+if [ ! -f "$BIN_FILE" ]; then SHOULD_BUILD=1; fi
+if [ $FORCE_REBUILD -eq 1 ]; then SHOULD_BUILD=1; fi
 
-# 1. Binary missing?
-if [ ! -f "$BIN_FILE" ]; then
-    SHOULD_BUILD=1
-# 2. Source newer than binary? (Automatic check)
-elif [ "$SRC_DIR/lira.cpp" -nt "$BIN_FILE" ]; then
-    SHOULD_BUILD=1
-# 3. User forced it?
-elif [ $FORCE_REBUILD -eq 1 ]; then
-    SHOULD_BUILD=1
-fi
+# Smart check for source changes
+for file in "$SRC_DIR"/*.cpp "$SRC_DIR"/*.h "$SRC_DIR"/*.hpp; do
+    if [ -f "$file" ] && [ "$file" -nt "$BIN_FILE" ]; then
+        SHOULD_BUILD=1
+        break
+    fi
+done
 
-# Execute Build if needed
 if [ $SHOULD_BUILD -eq 1 ]; then
     build_lira
 fi
 
-# --- Execution ---
-# Pass the filtered arguments (without --rebuild) to the binary
+# Execute
 "$BIN_FILE" "${ARGS[@]}"

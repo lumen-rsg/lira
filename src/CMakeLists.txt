@@ -5,22 +5,26 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Force colored output even when piping to logs
+set(CMAKE_COLOR_DIAGNOSTICS ON)
+if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+    add_compile_options(-fdiagnostics-color=always)
+elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+    add_compile_options(-fcolor-diagnostics)
+endif()
+
 # Dependencies
 find_package(CURL REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
-# Executable
+# Source Files (Updated for your refactor)
 add_executable(lira
         Agent.cpp
-        Agent.h
-        Helpers.h
         Nexus.cpp
-        Nexus.h
         StreamRenderer.cpp
-        StreamRenderer.h
         WebSearcher.cpp
-        WebSearcher.h
-        main.cpp)
+        main.cpp
+)
 
 # Linking
 target_link_libraries(lira PRIVATE
@@ -28,7 +32,7 @@ target_link_libraries(lira PRIVATE
         nlohmann_json::nlohmann_json
 )
 
-# Compile Options (Enable warnings, optimization)
+# Optimization
 if(MSVC)
     target_compile_options(lira PRIVATE /W4 /O2)
 else()
