@@ -1,34 +1,116 @@
-//
-// Created by cv2 on 14.12.2025.
-//
-
 #include "Agent.h"
-#include <fstream>
-#include <iostream>
-#include <regex>
-#include "Helpers.h"
+#include "StreamRenderer.h"
 #include "WebSearcher.h"
+#include "Helpers.h"
+#include <iostream>
+#include <fstream>
+#include <regex>
+#include <thread>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sys/utsname.h>
 
-namespace lira
-{
+namespace lira {
 
-    // Helper to strip <think> blocks for history preservation
-    // We don't want to save the internal monologue to the context window
+    // --- Helper: Strip Reasoning ---
     static std::string strip_reasoning(const std::string& input) {
-        // Regex to match <think>...content...</think> (dotall mode)
-        // Note: This is a simple regex. For massive streams, a state machine is safer,
-        // but for < 2048 tokens this is fine.
         std::regex think_regex(R"(<think>[\s\S]*?</think>)");
         return std::regex_replace(input, think_regex, "");
     }
 
-    Agent::Agent(const std::string& session_name) {
+    // --- Helper: Force Valid UTF-8 ---
+    // Replaces invalid bytes with '?' to prevent JSON crashes
+    static std::string sanitize_utf8(const std::string& str) {
+        std::string result;
+        result.reserve(str.size());
+
+        for (size_t i = 0; i < str.size(); ++i) {
+            unsigned char c = static_cast<unsigned char>(str[i]);
+            if (c < 0x80) {
+                // ASCII (0xxxxxxx)
+                result += c;
+            } else {
+                // Check Multibyte
+                int len = 0;
+                if ((c & 0xE0) == 0xC0) len = 2; // 110xxxxx
+                else if ((c & 0xF0) == 0xE0) len = 3; // 1110xxxx
+                else if ((c & 0xF8) == 0xF0) len = 4; // 11110xxx
+
+                bool valid = (len > 0) && (i + len <= str.size());
+                if (valid) {
+                    for (int j = 1; j < len; ++j) {
+                        if ((static_cast<unsigned char>(str[i + j]) & 0xC0) != 0x80) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (valid) {
+                    for (int j = 0; j < len; ++j) result += str[i + j];
+                    i += (len - 1);
+                } else {
+                    // Invalid byte found, replace with placeholder
+                    result += '?';
+                }
+            }
+        }
+        return result;
+    }
+
+    // --- Helper: Deep System Inspection ---
+    static std::string get_system_details() {
+        std::string info = "";
+
+        // 1. User & Shell
+        const char* user = std::getenv("USER");
+        const char* shell = std::getenv("SHELL");
+        // Sanitize immediately
+        info += std::format("- User: {}\n", user ? sanitize_utf8(user) : "unknown");
+        info += std::format("- Shell: {}\n", shell ? sanitize_utf8(shell) : "unknown");
+
+        // 2. Kernel Info
+        struct utsname buffer;
+        if (uname(&buffer) == 0) {
+            info += std::format("- Kernel: {} {} {}\n",
+                sanitize_utf8(buffer.sysname),
+                sanitize_utf8(buffer.release),
+                sanitize_utf8(buffer.machine));
+        }
+
+        // 3. OS Specifics
+        #ifdef __APPLE__
+            std::string sw = exec_command("sw_vers -productName");
+            std::string ver = exec_command("sw_vers -productVersion");
+            sw.erase(std::remove(sw.begin(), sw.end(), '\n'), sw.end());
+            ver.erase(std::remove(ver.begin(), ver.end(), '\n'), ver.end());
+            info += std::format("- OS: {} {}\n", sanitize_utf8(sw), sanitize_utf8(ver));
+        #else
+            std::ifstream os_file("/etc/os-release");
+            if (os_file.is_open()) {
+                std::string line;
+                while (std::getline(os_file, line)) {
+                    if (line.starts_with("PRETTY_NAME=")) {
+                        std::string name = line.substr(12);
+                        name.erase(std::remove(name.begin(), name.end(), '\"'), name.end());
+                        info += std::format("- OS: {}\n", sanitize_utf8(name));
+                        break;
+                    }
+                }
+            }
+        #endif
+
+        return info;
+    }
+
+    Agent::Agent(const std::string& session_name) : current_session_name(session_name) {
         const char* env_p = std::getenv("OPENROUTER_API_KEY");
         if(!env_p) { std::cerr << "Need OPENROUTER_API_KEY env var."; exit(1); }
         api_key = env_p;
         api_key.erase(std::ranges::remove_if(api_key, [](unsigned char x){return std::isspace(x);}).begin(), api_key.end());
 
-        std::filesystem::create_directories(SESSIONS_DIR);
+        fs::create_directories(SESSIONS_DIR);
         history_path = SESSIONS_DIR + "/" + session_name + ".json";
         load_history();
         std::cout << "\033[1;30m[Session: " << session_name << " loaded]\033[0m" << std::endl;
@@ -48,80 +130,102 @@ namespace lira
             history = new_h;
         }
         std::ofstream o(history_path);
-        o << history.dump(4);
+        // Use replace handler just in case something slipped through
+        o << history.dump(4, ' ', true, json::error_handler_t::replace);
+    }
+
+    std::vector<ChatMessage> Agent::get_display_history() {
+        std::vector<ChatMessage> display;
+        for (const auto& item : history) {
+            if (item["role"] == "system") continue;
+            // Handle potential nulls or missing fields gracefully
+            if (!item.contains("role") || !item.contains("content")) continue;
+
+            display.push_back({
+                item["role"].get<std::string>(),
+                item["content"].get<std::string>()
+            });
+        }
+        return display;
     }
 
     void Agent::process(std::string user_input) {
+        // Sanitize user input immediately
+        user_input = sanitize_utf8(user_input);
+
         std::string relevant_memories = nexus.retrieve_relevant(user_input);
 
-        // --- SYSTEM PROMPT ---
+        // Time & Date
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+        std::tm now_tm = *std::localtime(&now_c);
+        std::ostringstream date_ss;
+        date_ss << std::put_time(&now_tm, "%A, %B %d, %Y %I:%M %p");
+
+        std::string sys_info = get_system_details();
+        std::string cwd_safe = sanitize_utf8(fs::current_path().string());
+
+        // --- ENHANCED SYSTEM PROMPT ---
         std::string sys_prompt = std::format(
             "You are Lira.\n"
             "Persona: Smart, soft-spoken fennec girl. Skilled Linux/C++ expert.\n"
-            "Formatting:\n"
-            "1. **bold** (**actions**) ONLY.\n"
-            "2. `code` (single backtick) for short items.\n"
-            "3. ```code``` (triple backtick) for scripts.\n"
-            "4. NO emojis.\n"
-            "System: Linux/Bash. CWD: {}\n"
-            "Nexus:\n{}\n"
-            "Tools (Hidden):\n"
-            "- <cmd>command</cmd> : Execute shell.\n"
-            "- <write file=\"path\">content</write> : Write file (Auto-sanitized).\n"
-            "- <search>query</search> : DuckDuckGo Search.\n"
-            "- <remember>fact</remember> : Save info.\n"
-            "RULES:\n"
-            "1. **SILENT EXECUTION**: Output ONLY the tag to use a tool.\n"
-            "2. **NO HALLUCINATION**: Search before guessing specs.\n"
-            "3. **PLATONIC ONLY**: If sexual topics arise, **(ears droop)** and refuse.\n"
-            "4. **REASONING**: If capable, use <think>...</think> for internal logic, but keep it out of final output.\n"
-            "Be concise.",
-            fs::current_path().string(),
+            "Date: {}\n"
+            "\n"
+            "=== USER SYSTEM CONTEXT ===\n"
+            "{}"
+            "- CWD: {}\n"
+            "===========================\n"
+            "\n"
+            "=== MEMORY NEXUS (Long Term) ===\n"
+            "{}\n"
+            "================================\n"
+            "\n"
+            "Tools (Hidden tags):\n"
+            "- <cmd>command</cmd> : Execute shell (bash/zsh).\n"
+            "- <write file=\"path\">content</write> : Write file.\n"
+            "- <search>query</search> : Google Search.\n"
+            "- <remember>fact</remember> : Save to Nexus.\n"
+            "\n"
+            "MANDATORY PROTOCOLS:\n"
+            "1. **JOURNALING**: If the user tells you a preference, project detail, or name, you MUST use <remember> immediately to save it.\n"
+            "2. **CONTEXT AWARE**: Use the System Context above to tailor commands.\n"
+            "3. **TOOL FIRST**: Output ONLY the tag to use a tool. Don't chat before acting.\n"
+            "4. **FORMATTING**: **bold** for actions. `code` for items. NO emojis.\n"
+            "5. **PLATONIC**: If sexual topics arise, **(ears droop)** and refuse.\n",
+            date_ss.str(),
+            sys_info,
+            cwd_safe,
             relevant_memories
         );
 
         json msgs = json::array();
         msgs.push_back({{"role", "system"}, {"content", sys_prompt}});
-        // Load history
         for(auto& m : history) msgs.push_back(m);
-        // Add current input
         msgs.push_back({{"role", "user"}, {"content", user_input}});
 
         bool task_done = false;
         int turns = 0;
 
-        // --- AGENT LOOP ---
         while(!task_done && turns < 6) {
             std::cout << ANSI_MAGENTA << "Lira > " << ANSI_RESET << std::flush;
 
-            // Prepare Payload
             json pl = {
                 {"model", get_model()},
                 {"messages", msgs},
                 {"stream", true},
-                {"max_tokens", 4096} // Increased for reasoning models
+                {"max_tokens", 4096}
             };
 
-            // Stream Response
             StreamRenderer renderer;
-            // Note: Replace call with your actual http helper if located elsewhere
-            // Assuming http_post_stream is available (e.g. via extern or helper)
             extern void http_post_stream(const std::string&, const json&, const std::string&, StreamRenderer&);
             http_post_stream("https://openrouter.ai/api/v1/chat/completions", pl, api_key, renderer);
 
             std::string full_content = renderer.full_response;
-
-            // Check for empty response (error or connection drop)
             if (full_content.empty()) break;
 
-            // Clean Content for History (Remove <think> traces)
             std::string history_content = strip_reasoning(full_content);
-            if (history_content.empty()) {
-                // If model ONLY thought and output nothing, insert placeholder to maintain flow
-                history_content = "(thought process)";
-            }
+            if (history_content.empty()) history_content = "...";
 
-            // Update History
             msgs.push_back({{"role", "assistant"}, {"content", history_content}});
             history.push_back({{"role", "user"}, {"content", user_input}});
             history.push_back({{"role", "assistant"}, {"content", history_content}});
@@ -129,22 +233,19 @@ namespace lira
 
             bool requires_reprompt = false;
 
-            // --- TOOL: Web Search ---
+            // Search
             auto search_start = full_content.find("<search>");
             auto search_end = full_content.find("</search>");
             if (search_start != std::string::npos && search_end != std::string::npos) {
                 std::string query = full_content.substr(search_start + 8, search_end - (search_start + 8));
-
-                // Call Static WebSearcher
                 std::string result = WebSearcher::perform_search(query);
-
-                std::string output_block = "Search Result:\n" + result;
+                std::string output_block = "Search Result:\n" + sanitize_utf8(result);
                 msgs.push_back({{"role", "user"}, {"content", output_block}});
                 requires_reprompt = true;
                 user_input = output_block;
             }
 
-            // --- TOOL: Write File ---
+            // Write
             auto write_start = full_content.find("<write file=\"");
             if (write_start != std::string::npos) {
                 size_t file_start = write_start + 13;
@@ -156,7 +257,6 @@ namespace lira
                     std::string fname = full_content.substr(file_start, file_end - file_start);
                     std::string fcontent = full_content.substr(content_start, content_end - content_start);
 
-                    // Sanitize: Remove markdown fences if Lira included them
                     if (fcontent.find("```") != std::string::npos) {
                          size_t code_start = fcontent.find("```");
                          size_t newline = fcontent.find('\n', code_start);
@@ -164,14 +264,12 @@ namespace lira
                          size_t code_end = fcontent.rfind("```");
                          if (code_end != std::string::npos) fcontent = fcontent.substr(0, code_end);
                     }
-                    // Trim whitespace
                     const char* ws = " \t\n\r\f\v";
                     size_t start = fcontent.find_first_not_of(ws);
                     if (start != std::string::npos) fcontent.erase(0, start);
                     size_t end = fcontent.find_last_not_of(ws);
                     if (end != std::string::npos) fcontent.erase(end + 1);
 
-                    // Write
                     std::ofstream of(fname);
                     of << fcontent;
                     of.close();
@@ -183,7 +281,7 @@ namespace lira
                 }
             }
 
-            // --- TOOL: Nexus (Memory) ---
+            // Nexus
             auto mem_start = full_content.find("<remember>");
             auto mem_end = full_content.find("</remember>");
             if (mem_start != std::string::npos && mem_end != std::string::npos) {
@@ -191,16 +289,15 @@ namespace lira
                 nexus.add_memory(fact);
             }
 
-            // --- TOOL: Command Execution ---
+            // Command
             auto cmd_start = full_content.find("<cmd>");
             auto cmd_end = full_content.find("</cmd>");
             if (cmd_start != std::string::npos && cmd_end != std::string::npos) {
                 std::string cmd = full_content.substr(cmd_start + 5, cmd_end - (cmd_start + 5));
 
-                // CD Trap (Internal State Sync)
                 if (cmd.starts_with("cd ")) {
                      std::string target_dir = cmd.substr(3);
-                     std::erase(target_dir, '\"'); // Remove quotes
+                     std::erase(target_dir, '\"');
                      try {
                          fs::current_path(target_dir);
                          std::cout << ANSI_BLUE << "[CWD] Changed to " << fs::current_path().string() << ANSI_RESET << std::endl;
@@ -213,19 +310,19 @@ namespace lira
                          user_input = "CD Failed";
                      }
                 } else {
-                    // Standard Command
                     std::cout << "\033[1;33m[EXEC] \033[1;37m" << cmd << "\033[0m\nAllow? [y/N]: ";
                     char c; std::cin >> c;
-                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // Flush buffer
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
                     if(c == 'y' || c == 'Y') {
                         std::string out = exec_command(cmd.c_str());
+                        // Sanitize output!
+                        std::string clean_out = sanitize_utf8(out);
 
-                        // Output Preview (Truncate if massive)
-                        std::string out_prev = out.length() > 500 ? out.substr(0,500) + "\n...(truncated)" : out;
+                        std::string out_prev = clean_out.length() > 500 ? clean_out.substr(0,500) + "\n...(truncated)" : clean_out;
                         std::cout << "\033[0;32m" << out_prev << "\033[0m\n";
 
-                        std::string output_block = "Output:\n" + out;
+                        std::string output_block = "Output:\n" + clean_out;
                         msgs.push_back({{"role", "user"}, {"content", output_block}});
                         requires_reprompt = true;
                         user_input = output_block;
@@ -242,4 +339,4 @@ namespace lira
         }
     }
 
-}
+} // namespace

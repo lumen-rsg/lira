@@ -10,9 +10,16 @@
 
 namespace lira
 {
+
+    struct ChatMessage {
+        std::string role;
+        std::string content;
+    };
+
     class Agent {
         std::string api_key;
-        nlohmann::json history;
+        // json history; // Changed to public access via getter or friend, see below.
+        // Actually, let's keep it private but provide a converter.
         std::string history_path;
         Nexus nexus;
 
@@ -20,7 +27,13 @@ namespace lira
         void save_history();
 
     public:
+        nlohmann::json history; // Made public for direct GUI access (simplifies binding)
+        std::string current_session_name;
+
         explicit Agent(const std::string& session_name);
         void process(std::string user_input);
+
+        // Helper to get clean vector for GUI
+        std::vector<ChatMessage> get_display_history();
     };
 }
